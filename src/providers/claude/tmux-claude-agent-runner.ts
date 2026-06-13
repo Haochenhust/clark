@@ -5,25 +5,32 @@
  * Per turn (v1, ephemeral pane):
  *   1. write a `--settings` file whose Stop hook `touch`es a sentinel,
  *   2. `tmux new-session -d` running `claude --resume|--session-id … --settings …`
- *      (NO `--print`; ANTHROPIC_API_KEY is unset so it uses subscription auth),
+ *      (NO `--print`; the env is sanitized — see SANITIZED_ENV_VARS — so it
+ *      uses subscription auth AND writes a real top-level transcript),
  *   3. wait for the TUI to settle, then inject the prompt via bracketed paste,
  *   4. tail `~/.claude/projects/<cwd>/<sessionId>.jsonl`, yielding each new
  *      assistant/tool/system message as it lands,
- *   5. stop when the Stop-hook sentinel appears, synthesize a RunResult, kill
- *      the pane.
+ *   5. stop when the Stop-hook sentinel appears, drain late-flushed lines for
+ *      STOP_DRAIN_MS, synthesize a RunResult, kill the pane.
  *
  * It matches the AgentRunner contract 1:1 (same 4 yielded shapes), so no
  * consumer (live card, Session.stream) changes.
+ *
+ * Validated end-to-end: subscription billing, content capture, real token
+ * usage, and multi-turn `--resume` with cross-turn memory. NB: interactive
+ * `--resume <id>` APPENDS to the same `<id>.jsonl` in place (it does NOT fork to
+ * a new transcript id the way `--print` does), so findTranscriptById(sessionId)
+ * is correct for both fresh and resumed turns.
  *
  * NB: the readiness/trust-prompt heuristic (waitUntilReady) is the main
  * runtime-tunable part — validate against your machine + claude version.
  * Tunables: CLARK_TMUX_* env vars (see below).
  *
  * Known v1 limitations (to harden later): all chats share one workspace cwd /
- * project dir; and a resumed session that Claude forks to a NEW transcript id
- * surfaces only as a fast "no output" failure — the planned fix is a SessionStart
- * hook that reports the real session id. Long-lived warm panes + idle eviction +
- * restart re-attach are a planned v2.
+ * project dir. A session that Claude forks to a NEW id (e.g. via `/compact` or
+ * a manual double-escape fork) would surface as a fast "no output" failure; the
+ * planned hardening is a SessionStart hook reporting the real session id. Long-
+ * lived warm panes + idle eviction + restart re-attach are a planned v2.
  */
 import {
   existsSync,
@@ -71,8 +78,42 @@ const READY_TIMEOUT_MS = parseInt(getEnv("CLARK_TMUX_READY_TIMEOUT_MS", "30000")
 const TAIL_POLL_MS = parseInt(getEnv("CLARK_TMUX_TAIL_POLL_MS", "250"), 10);
 /** Fail fast if claude produces NO transcript output within this long after injecting. */
 const RESPONSE_GRACE_MS = parseInt(getEnv("CLARK_TMUX_RESPONSE_GRACE_MS", "30000"), 10);
+/**
+ * After the Stop sentinel fires, keep tailing this long to drain the final
+ * assistant line — claude often flushes it to disk a beat AFTER touching the
+ * sentinel, so breaking immediately drops the actual answer.
+ */
+const STOP_DRAIN_MS = parseInt(getEnv("CLARK_TMUX_STOP_DRAIN_MS", "1500"), 10);
 /** Hard ceiling on a single turn. */
 const TURN_TIMEOUT_MS = parseInt(getEnv("CLARK_TMUX_TURN_TIMEOUT_MS", "600000"), 10);
+/** Pause after pasting the prompt before sending Enter, so Ink absorbs the paste. */
+const INJECT_ENTER_DELAY_MS = parseInt(getEnv("CLARK_TMUX_INJECT_ENTER_DELAY_MS", "200"), 10);
+
+/**
+ * Env vars unset before launching the pane's `claude`. They're only present
+ * when clark itself was started from *inside* a Claude Code / cmux session, but
+ * if inherited they break the runner:
+ *   - CLAUDE_CODE_CHILD_SESSION / CLAUDE_CODE_SESSION_ID make the spawned claude
+ *     behave as a NESTED child → it runs the turn and bills, but writes NO
+ *     top-level transcript .jsonl, so content capture silently yields nothing.
+ *   - NODE_OPTIONS may point at a harness `--require` shim that instruments
+ *     (and slows / re-bills) the child node process.
+ *   - ANTHROPIC_API_KEY would force per-API-token billing instead of the
+ *     logged-in Claude Code subscription — the whole reason this runner exists.
+ * Unsetting them guarantees a clean top-level interactive session every time.
+ */
+const SANITIZED_ENV_VARS = [
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_CHILD_SESSION",
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_CODE_EXECPATH",
+  "CLAUDE_CODE_NO_FLICKER",
+  "CLAUDECODE",
+  "CLAUDE_EFFORT",
+  "AI_AGENT",
+  "NODE_OPTIONS",
+] as const;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -247,9 +288,9 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
       "--settings",
       settingsPath,
     ];
-    // `unset ANTHROPIC_API_KEY` is critical: if it leaks in from the tmux server
-    // env, claude would bill per-API-token instead of using the subscription.
-    const command = `unset ANTHROPIC_API_KEY; exec ${["claude", ...claudeArgs].map(shellQuote).join(" ")}`;
+    // Sanitize the env so the pane's claude is always a clean, top-level,
+    // subscription-billed interactive session (see SANITIZED_ENV_VARS).
+    const command = `unset ${SANITIZED_ENV_VARS.join(" ")}; exec ${["claude", ...claudeArgs].map(shellQuote).join(" ")}`;
 
     // Env passed into the pane (lark-cli targeting + skill helpers); never ANTHROPIC_API_KEY.
     const envArgs: string[] = [];
@@ -310,6 +351,9 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
       writeFileSync(promptFile, prompt);
       await tmux(["load-buffer", "-b", "clark", promptFile]);
       await tmux(["paste-buffer", "-b", "clark", "-p", "-d", "-t", name]);
+      // Give Ink a beat to absorb the bracketed paste before submitting,
+      // otherwise Enter can race the paste and the prompt sits unsubmitted.
+      await sleep(INJECT_ENTER_DELAY_MS);
       await tmux(["send-keys", "-t", name, "Enter"]);
       logger.debug({ session_id: sessionId, bytes: prompt.length }, "prompt injected");
       const injectedAt = Date.now();
@@ -317,6 +361,8 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
       // Tail the transcript and watch for the Stop sentinel.
       let done = false;
       let sawContent = false;
+      let drainUntil = 0;
+      let loggedTranscript = false;
       while (true) {
         checkAbort();
         if (Date.now() - launchedAt > TURN_TIMEOUT_MS) {
@@ -325,6 +371,10 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
         }
 
         if (!transcript) transcript = findTranscriptById(sessionId);
+        if (transcript && !loggedTranscript) {
+          logger.debug({ session_id: sessionId, transcript }, "transcript resolved");
+          loggedTranscript = true;
+        }
 
         if (transcript) {
           // Drop the trailing split element (empty terminator or partial write).
@@ -339,15 +389,18 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
           baselineLines = complete.length;
         }
 
-        if (done) break;
-        if (existsSync(sentinel)) {
-          // Turn finished; loop once more to drain any final lines, then exit.
+        if (done) {
+          // Keep draining until the post-sentinel window elapses (above read
+          // already captured anything flushed this poll), then exit.
+          if (Date.now() >= drainUntil) break;
+        } else if (existsSync(sentinel)) {
+          // Turn finished; keep tailing briefly for the late-flushed final line.
+          logger.debug({ session_id: sessionId, baselineLines, sawContent }, "stop sentinel seen; draining");
           done = true;
-          continue;
-        }
-        // Fail fast if claude produced nothing this turn (bad login, lost prompt,
-        // or a resumed session that forked to a different transcript id).
-        if (!sawContent && Date.now() - injectedAt > RESPONSE_GRACE_MS) {
+          drainUntil = Date.now() + STOP_DRAIN_MS;
+        } else if (!sawContent && Date.now() - injectedAt > RESPONSE_GRACE_MS) {
+          // Fail fast if claude produced nothing this turn (bad login, lost prompt,
+          // or a resumed session that forked to a different transcript id).
           throw new Error(
             "claude produced no transcript output for this turn — check that `claude` is logged in, " +
               "tmux input reached the pane, and the resumed session id matches its transcript",
@@ -355,6 +408,7 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
         }
         await sleep(TAIL_POLL_MS);
       }
+      logger.debug({ session_id: sessionId, sawContent, baselineLines }, "turn loop exit");
 
       const result: RunResult = {
         type: "run_result",
