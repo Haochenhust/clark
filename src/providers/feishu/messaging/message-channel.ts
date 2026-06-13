@@ -897,9 +897,11 @@ export class FeishuMessageChannel
     } else if (type === "image") {
       const file_key = json.image_key as string;
       const path = await this.downloadMessageResource(messageId, file_key);
+      // Plain text (NOT `![](…)` markdown): a line starting with `!` is treated
+      // as a bash command by the interactive `claude` TUI the runner drives.
       return {
         type: "text",
-        text: `![user_uploaded_image](${path})`,
+        text: `The user sent an image. Read \`${path}\` to view it, then respond.`,
       };
     } else if (type === "file") {
       const file_key = json.file_key as string;

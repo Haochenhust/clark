@@ -346,9 +346,12 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
       let transcript = findTranscriptById(sessionId);
       let baselineLines = transcript ? countCompleteLines(readFileSync(transcript, "utf-8")) : 0;
 
-      // Inject the prompt via bracketed paste, then Enter.
+      // Inject the prompt via bracketed paste, then Enter. A prompt starting
+      // with `!` would be taken as a bash command by the interactive TUI (even
+      // under bracketed paste), so prepend a space to neutralize it.
       checkAbort();
-      writeFileSync(promptFile, prompt);
+      const injectPrompt = prompt.startsWith("!") ? ` ${prompt}` : prompt;
+      writeFileSync(promptFile, injectPrompt);
       await tmux(["load-buffer", "-b", "clark", promptFile]);
       await tmux(["paste-buffer", "-b", "clark", "-p", "-d", "-t", name]);
       // Give Ink a beat to absorb the bracketed paste before submitting,
