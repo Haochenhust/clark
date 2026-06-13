@@ -1,0 +1,18 @@
+node_modules/
+
+# secrets & local config
+.env
+
+# sqlite store + runtime state
+store/*.db
+store/*.db-shm
+store/*.db-wal
+store/*.pid
+store/sessions/
+
+# runtime workspace artifacts (the workspace/ dir itself is tracked, but not its runtime output)
+workspace/uploads/
+workspace/logs/
+
+*.log
+.DS_Store
