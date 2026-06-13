@@ -121,20 +121,29 @@ class Kernel {
 
   private _initLarkCliConfig(): void {
     const bot = config.feishu;
+    if (!bot.appId || !bot.appSecret) return;
     const dir = bot.larkCliConfigDir;
     const configFile = `${dir}/config.json`;
     if (Bun.file(configFile).size > 0) {
       this._logger.debug({ dir }, "lark-cli config already exists");
       return;
     }
-    const result = Bun.spawnSync(
-      ["lark-cli", "config", "init", "--app-id", bot.appId, "--app-secret-stdin", "--brand", "feishu"],
-      { stdin: Buffer.from(bot.appSecret), env: { ...Bun.env, LARKSUITE_CLI_CONFIG_DIR: dir } },
-    );
-    if (result.exitCode === 0) {
-      this._logger.info({ dir }, "initialized lark-cli config");
-    } else {
-      this._logger.warn({ stderr: result.stderr.toString() }, "failed to init lark-cli config");
+    try {
+      const result = Bun.spawnSync(
+        ["lark-cli", "config", "init", "--app-id", bot.appId, "--app-secret-stdin", "--brand", "feishu"],
+        { stdin: Buffer.from(bot.appSecret), env: { ...Bun.env, LARKSUITE_CLI_CONFIG_DIR: dir } },
+      );
+      if (result.exitCode === 0) {
+        this._logger.info({ dir }, "initialized lark-cli config");
+      } else {
+        this._logger.warn({ stderr: result.stderr.toString() }, "failed to init lark-cli config");
+      }
+    } catch (err) {
+      // Bun.spawnSync throws (not non-zero exit) when lark-cli is not installed.
+      this._logger.warn(
+        { err },
+        "lark-cli not found — skipping config init; Feishu-API skills will be unavailable",
+      );
     }
   }
 
@@ -204,6 +213,10 @@ class Kernel {
       sessionId = uuid();
     }
     message.session_id = sessionId;
+    // Bind the chat→session mapping NOW (not only at turn end) so /stop and
+    // rapid follow-up messages resolve to the session that is actually running,
+    // and so a failed/aborted first turn still keeps the chat on its session.
+    this._sessionManager.bindChatSession(chatId, sessionId);
 
     const task: InboundMessageTaskPayload = {
       type: "inbound_message",
@@ -554,10 +567,15 @@ class Kernel {
     const assistantMessage = await session.run(userMessage, { signal });
     if (extractTextContent(assistantMessage).includes("[SKIPPED]")) return;
 
-    if (chatId) {
-      (assistantMessage as AssistantMessage & { _feishu_chat_id?: string })
-        ._feishu_chat_id = chatId;
+    const target = chatId ?? config.notifyChatId;
+    if (!target) {
+      this._logger.warn(
+        { task_id: _taskId },
+        "scheduled task has no chat_id and NOTIFY_CHAT_ID is unset — dropping result",
+      );
+      return;
     }
+    (assistantMessage as AssistantMessage & { _feishu_chat_id?: string })._feishu_chat_id = target;
     await this._messageGateway.postMessage(assistantMessage);
   };
 

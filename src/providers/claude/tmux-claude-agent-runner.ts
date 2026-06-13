@@ -15,11 +15,15 @@
  * It matches the AgentRunner contract 1:1 (same 4 yielded shapes), so no
  * consumer (live card, Session.stream) changes.
  *
- * NB: the readiness/trust-prompt heuristics (waitUntilReady) and the resume
- * transcript discovery are the runtime-tunable parts — validate against your
- * machine + claude version. Tunables: CLARK_TMUX_* env vars (see below).
+ * NB: the readiness/trust-prompt heuristic (waitUntilReady) is the main
+ * runtime-tunable part — validate against your machine + claude version.
+ * Tunables: CLARK_TMUX_* env vars (see below).
  *
- * Long-lived warm panes + idle eviction + restart re-attach are a planned v2.
+ * Known v1 limitations (to harden later): all chats share one workspace cwd /
+ * project dir; and a resumed session that Claude forks to a NEW transcript id
+ * surfaces only as a fast "no output" failure — the planned fix is a SessionStart
+ * hook that reports the real session id. Long-lived warm panes + idle eviction +
+ * restart re-attach are a planned v2.
  */
 import {
   existsSync,
@@ -27,7 +31,6 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -66,6 +69,8 @@ const READY_QUIESCE_MS = parseInt(getEnv("CLARK_TMUX_READY_QUIESCE_MS", "800"), 
 const READY_TIMEOUT_MS = parseInt(getEnv("CLARK_TMUX_READY_TIMEOUT_MS", "30000"), 10);
 /** Poll interval while tailing the transcript + watching for the sentinel. */
 const TAIL_POLL_MS = parseInt(getEnv("CLARK_TMUX_TAIL_POLL_MS", "250"), 10);
+/** Fail fast if claude produces NO transcript output within this long after injecting. */
+const RESPONSE_GRACE_MS = parseInt(getEnv("CLARK_TMUX_RESPONSE_GRACE_MS", "30000"), 10);
 /** Hard ceiling on a single turn. */
 const TURN_TIMEOUT_MS = parseInt(getEnv("CLARK_TMUX_TURN_TIMEOUT_MS", "600000"), 10);
 
@@ -75,12 +80,17 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-/** Run a tmux subcommand, capturing stdout/stderr. */
+/** Run a tmux subcommand, capturing stdout/stderr. Never throws — tmux-absent → code 127. */
 async function tmux(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(["tmux", ...args], { stdout: "pipe", stderr: "pipe" });
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(["tmux", ...args], { stdout: "pipe", stderr: "pipe" });
+  } catch {
+    return { code: 127, stdout: "", stderr: "tmux not found — install tmux (e.g. brew install tmux)" };
+  }
   const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
+    new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
+    new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
   ]);
   const code = await proc.exited;
   return { code, stdout, stderr };
@@ -107,14 +117,9 @@ function stopHookSettings(sentinel: string): string {
   });
 }
 
-/** Claude encodes a cwd into its project dir name by replacing non-alphanumerics with '-'. */
-function encodeProjectDir(cwd: string): string {
-  return cwd.replace(/[^a-zA-Z0-9]/g, "-");
-}
-
 const projectsRoot = join(homedir(), ".claude", "projects");
 
-/** Primary: find `<sessionId>.jsonl` anywhere under ~/.claude/projects (ids are unique). */
+/** Find `<sessionId>.jsonl` anywhere under ~/.claude/projects (ids are globally unique). */
 function findTranscriptById(sessionId: string): string | null {
   if (!existsSync(projectsRoot)) return null;
   for (const dir of readdirSync(projectsRoot)) {
@@ -124,18 +129,14 @@ function findTranscriptById(sessionId: string): string | null {
   return null;
 }
 
-/** Fallback (handles --resume forking to a new id): newest jsonl in the cwd's project dir touched after `since`. */
-function findTranscriptByCwd(cwd: string, since: number): string | null {
-  const dir = join(projectsRoot, encodeProjectDir(cwd));
-  if (!existsSync(dir)) return null;
-  let best: { path: string; mtime: number } | null = null;
-  for (const f of readdirSync(dir)) {
-    if (!f.endsWith(".jsonl")) continue;
-    const p = join(dir, f);
-    const mtime = statSync(p).mtimeMs;
-    if (mtime >= since && (!best || mtime > best.mtime)) best = { path: p, mtime };
-  }
-  return best?.path ?? null;
+/**
+ * Count complete (newline-terminated) lines in transcript text. `split("\n")` on
+ * a newline-terminated file yields a trailing "" (or a partial half-written line
+ * mid-write); the last element is therefore never a complete line, so we drop it.
+ * Counting it would skip one real line on every poll.
+ */
+function countCompleteLines(raw: string): number {
+  return Math.max(0, raw.split("\n").length - 1);
 }
 
 interface RunState {
@@ -250,7 +251,7 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
     // env, claude would bill per-API-token instead of using the subscription.
     const command = `unset ANTHROPIC_API_KEY; exec ${["claude", ...claudeArgs].map(shellQuote).join(" ")}`;
 
-    // Env passed into the pane (lark-cli targeting); never ANTHROPIC_API_KEY.
+    // Env passed into the pane (lark-cli targeting + skill helpers); never ANTHROPIC_API_KEY.
     const envArgs: string[] = [];
     const pushEnv = (k: string, v: string | undefined) => {
       if (v) envArgs.push("-e", `${k}=${v}`);
@@ -259,10 +260,12 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
     pushEnv("FEISHU_APP_SECRET", config.feishu.appSecret);
     pushEnv("LARKSUITE_CLI_CONFIG_DIR", config.feishu.larkCliConfigDir);
     if (options.chatId) pushEnv("FEISHU_CHAT_ID", options.chatId);
-    // Absolute store paths so workspace skills (scheduled-tasks, restart) reach the
-    // db/pid without guessing the repo root from a (possibly custom) workspace cwd.
+    // Absolute store paths + the running session id, so workspace skills
+    // (scheduled-tasks, restart) reach the db/pid and identify themselves
+    // without guessing the repo root from a (possibly custom) workspace cwd.
     pushEnv("CLARK_DB", config.paths.resolveDataFilePath("clark.db"));
     pushEnv("CLARK_PID", config.paths.resolveDataFilePath("clark.pid"));
+    pushEnv("CLARK_SESSION_ID", sessionId);
 
     const launchedAt = Date.now();
     const state: RunState = {
@@ -297,9 +300,10 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
 
       await this._waitUntilReady(name, signal);
 
-      // Resolve the transcript path (primary by id; fallback handles resume-fork).
+      // Resolve the transcript path by session id (forked-resume ids surface as a
+      // fast "no output" failure via the grace check below).
       let transcript = findTranscriptById(sessionId);
-      let baselineLines = transcript ? this._countLines(transcript) : 0;
+      let baselineLines = transcript ? countCompleteLines(readFileSync(transcript, "utf-8")) : 0;
 
       // Inject the prompt via bracketed paste, then Enter.
       checkAbort();
@@ -308,9 +312,11 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
       await tmux(["paste-buffer", "-b", "clark", "-p", "-d", "-t", name]);
       await tmux(["send-keys", "-t", name, "Enter"]);
       logger.debug({ session_id: sessionId, bytes: prompt.length }, "prompt injected");
+      const injectedAt = Date.now();
 
       // Tail the transcript and watch for the Stop sentinel.
       let done = false;
+      let sawContent = false;
       while (true) {
         checkAbort();
         if (Date.now() - launchedAt > TURN_TIMEOUT_MS) {
@@ -318,21 +324,19 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
           break;
         }
 
-        if (!transcript) {
-          transcript =
-            findTranscriptById(sessionId) ?? findTranscriptByCwd(cwd, launchedAt);
-          if (transcript) baselineLines = 0;
-        }
+        if (!transcript) transcript = findTranscriptById(sessionId);
 
         if (transcript) {
-          const lines = readFileSync(transcript, "utf-8").split("\n");
-          for (let i = baselineLines; i < lines.length; i++) {
-            const line = lines[i]?.trim();
+          // Drop the trailing split element (empty terminator or partial write).
+          const complete = readFileSync(transcript, "utf-8").split("\n").slice(0, -1);
+          for (let i = baselineLines; i < complete.length; i++) {
+            const line = complete[i]?.trim();
             if (!line) continue;
             const parsed = parseJsonlLine(line, sessionId, state);
             if (parsed) yield parsed;
           }
-          baselineLines = lines.length;
+          if (complete.length > baselineLines) sawContent = true;
+          baselineLines = complete.length;
         }
 
         if (done) break;
@@ -340,6 +344,14 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
           // Turn finished; loop once more to drain any final lines, then exit.
           done = true;
           continue;
+        }
+        // Fail fast if claude produced nothing this turn (bad login, lost prompt,
+        // or a resumed session that forked to a different transcript id).
+        if (!sawContent && Date.now() - injectedAt > RESPONSE_GRACE_MS) {
+          throw new Error(
+            "claude produced no transcript output for this turn — check that `claude` is logged in, " +
+              "tmux input reached the pane, and the resumed session id matches its transcript",
+          );
         }
         await sleep(TAIL_POLL_MS);
       }
@@ -396,14 +408,6 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
         return;
       }
       await sleep(150);
-    }
-  }
-
-  private _countLines(path: string): number {
-    try {
-      return readFileSync(path, "utf-8").split("\n").length;
-    } catch {
-      return 0;
     }
   }
 }

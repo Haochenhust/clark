@@ -3,12 +3,9 @@ node_modules/
 # secrets & local config
 .env
 
-# sqlite store + runtime state
-store/*.db
-store/*.db-shm
-store/*.db-wal
-store/*.pid
-store/sessions/
+# runtime store: sqlite db, pid file, session transcripts, lark-cli config
+# (contains the Feishu APP SECRET), and tmux scratch — NEVER commit any of it.
+store/
 
 # runtime workspace artifacts (the workspace/ dir itself is tracked, but not its runtime output)
 workspace/uploads/

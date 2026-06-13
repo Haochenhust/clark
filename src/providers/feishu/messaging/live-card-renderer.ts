@@ -259,7 +259,7 @@ function _formatThought(text: string): string | null {
  *
  *   - Chinese sentence ends (。！？) always split.
  *   - English sentence ends (.!?) split only when followed by whitespace or EOS,
- *     so file paths like `/Users/chenhao/.claude/...` stay intact.
+ *     so file paths like `~/.claude/...` stay intact.
  */
 function _firstSentence(text: string): string {
   for (let i = 0; i < text.length; i++) {

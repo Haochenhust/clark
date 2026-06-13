@@ -178,11 +178,7 @@ async function _uploadMessageResource(
             const response = await fetch(imagePath);
             const imageBuffer = await response.arrayBuffer();
             const imageName = imagePath.split("/").pop();
-            const downloadPath = nodePath.join(
-              config.paths.root,
-              "workspace",
-              "downloads",
-            );
+            const downloadPath = nodePath.join(config.workspaceDir, "downloads");
             if (!fs.existsSync(downloadPath)) {
               fs.mkdirSync(downloadPath, { recursive: true });
             }
@@ -191,13 +187,13 @@ async function _uploadMessageResource(
                 nodePath.join(downloadPath, imageName),
                 Buffer.from(imageBuffer),
               );
-              imagePath = nodePath.join("workspace", "downloads", imageName);
+              imagePath = nodePath.join("downloads", imageName);
             }
           } catch {
             text = text.replaceAll(image, `[${imagePath}](${imagePath})`);
           }
         }
-        if (fs.existsSync(nodePath.join(config.paths.root, imagePath))) {
+        if (fs.existsSync(nodePath.join(config.workspaceDir, imagePath))) {
           const imageKey = await uploadImage(imagePath);
           text = text.replaceAll(image, `![image](${imageKey})`);
         } else {

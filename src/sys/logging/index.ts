@@ -1,9 +1,11 @@
 import pino from "pino";
 
+import { getEnv } from "../config/env-reader";
+
 const VALID_LEVELS = ["trace", "debug", "info", "warn", "error"] as const;
 
 function parseLevel(): pino.Level {
-  const raw = process.env.CLARK_LOG_LEVEL?.toLowerCase();
+  const raw = getEnv("CLARK_LOG_LEVEL").toLowerCase();
   if (raw && VALID_LEVELS.includes(raw as (typeof VALID_LEVELS)[number])) {
     return raw as pino.Level;
   }

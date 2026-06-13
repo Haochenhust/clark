@@ -470,7 +470,7 @@ export class FeishuMessageChannel
    * @returns The key of the uploaded image.
    */
   async uploadImage(path: string): Promise<string> {
-    const absPath = nodePath.join(config.paths.root, path);
+    const absPath = nodePath.join(config.workspaceDir, path);
     const file = fs.readFileSync(absPath);
     this._logger.info(`Uploading image ${absPath}`);
     const res = await this._client.im.v1.image.create({
@@ -495,7 +495,7 @@ export class FeishuMessageChannel
    * @returns The key of the uploaded file.
    */
   async uploadFile(filePath: string): Promise<string> {
-    const absPath = nodePath.join(config.paths.root, filePath);
+    const absPath = nodePath.join(config.workspaceDir, filePath);
     const file = fs.createReadStream(absPath);
     const fileName = nodePath.basename(absPath);
     const ext = nodePath.extname(absPath).slice(1).toLowerCase();
@@ -698,7 +698,7 @@ export class FeishuMessageChannel
       if (
         filePath &&
         !filePath.includes("://") &&
-        fs.existsSync(nodePath.join(config.paths.root, filePath))
+        fs.existsSync(nodePath.join(config.workspaceDir, filePath))
       ) {
         paths.push(filePath);
       }

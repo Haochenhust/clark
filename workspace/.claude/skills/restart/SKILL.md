@@ -34,11 +34,12 @@ LOG="$ROOT/store/clark.stdout.log"
 
 ## Check for other active tasks
 
-clark runs one turn at a time per session, but other chats may be mid-task. Find
-this chat's session, then look for active tasks that belong to anyone else:
+clark runs one turn at a time per session, but other chats may be mid-task. This
+turn's own session id is in `$CLARK_SESSION_ID`; look for active tasks belonging
+to anyone else:
 
 ```bash
-SELF_SESSION=$(sqlite3 "$DB" "SELECT session_id FROM chat_sessions WHERE chat_id = '$FEISHU_CHAT_ID'")
+SELF_SESSION="$CLARK_SESSION_ID"
 
 OTHER=$(sqlite3 -separator '|' "$DB" "
   SELECT t.id, t.status
