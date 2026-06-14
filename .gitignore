@@ -7,9 +7,13 @@ node_modules/
 # (contains the Feishu APP SECRET), and tmux scratch — NEVER commit any of it.
 store/
 
-# runtime workspace artifacts (the workspace/ dir itself is tracked, but not its runtime output)
-workspace/uploads/
-workspace/logs/
+# Runtime workspace: the bot uses workspace/ as its cwd and writes uploads, logs,
+# and arbitrary scratch files there. Ignore everything EXCEPT the tracked template
+# — persona (CLAUDE.md), Claude config + skills (.claude/), and MCP config.
+workspace/*
+!workspace/CLAUDE.md
+!workspace/.claude/
+!workspace/.mcp.json
 
 *.log
 .DS_Store
