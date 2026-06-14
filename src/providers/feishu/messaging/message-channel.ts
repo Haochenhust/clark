@@ -48,6 +48,15 @@ function _isFeishuBadRequestError(err: unknown): boolean {
   );
 }
 
+/** Options for rendering a finalized live card (steps panel + run footer). */
+interface FinalLiveCardOpts {
+  progressLines: string[];
+  elapsedMs: number;
+  state: Exclude<LiveCardState, "running">;
+  runResult?: import("@/sys").RunResult;
+  effortLevel?: string;
+}
+
 /** Message channel implementation for Feishu (Lark) chat platform. */
 export class FeishuMessageChannel
   extends EventEmitter<MessageChannelEventTypes>
@@ -320,21 +329,12 @@ export class FeishuMessageChannel
    * fresh reply with the full content — otherwise the user would be stuck on
    * the "processing" card state.
    */
-  async patchFinalLiveCard(
-    messageId: string,
-    message: AssistantMessage,
-    opts: {
-      progressLines: string[];
-      elapsedMs: number;
-      state: Exclude<LiveCardState, "running">;
-      runResult?: import("@/sys").RunResult;
-      effortLevel?: string;
-    },
-  ): Promise<void> {
-    if (this._failedCardUpdateMessages.has(messageId)) {
-      throw new Error(`Live card ${messageId} was previously marked dead.`);
-    }
-
+  /**
+   * Render a finalized live card (first chunk in the card + any overflow
+   * chunks to send as follow-ups). Shared by patch (update existing) and post
+   * (fresh reply). Applies the ~28KB Feishu card-size guard.
+   */
+  private async _buildFinalCard(message: AssistantMessage, opts: FinalLiveCardOpts) {
     let { firstMessageContent, remainingChunks } = this._prepareMessageContent(
       message.content,
       false,
@@ -359,8 +359,7 @@ export class FeishuMessageChannel
     // Guard: if the card JSON exceeds Feishu's ~28KB limit, re-split the
     // markdown portion into smaller chunks and keep only the first in the card.
     const MAX_CARD_BYTES = 25_000;
-    const cardJson = JSON.stringify(finalCard);
-    if (Buffer.byteLength(cardJson, "utf-8") > MAX_CARD_BYTES) {
+    if (Buffer.byteLength(JSON.stringify(finalCard), "utf-8") > MAX_CARD_BYTES) {
       const lastText = firstMessageContent.findLast((c) => c.type === "text");
       if (lastText && lastText.type === "text") {
         const sizeChunks = splitMarkdownBySize(lastText.text, 8_000);
@@ -376,6 +375,20 @@ export class FeishuMessageChannel
         });
       }
     }
+
+    return { finalCard, remainingChunks };
+  }
+
+  async patchFinalLiveCard(
+    messageId: string,
+    message: AssistantMessage,
+    opts: FinalLiveCardOpts,
+  ): Promise<void> {
+    if (this._failedCardUpdateMessages.has(messageId)) {
+      throw new Error(`Live card ${messageId} was previously marked dead.`);
+    }
+
+    const { finalCard, remainingChunks } = await this._buildFinalCard(message, opts);
 
     this._logOutboundMessage(message.session_id, message.content);
 

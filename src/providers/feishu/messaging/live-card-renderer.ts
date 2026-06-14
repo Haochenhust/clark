@@ -335,14 +335,18 @@ function _renderFooter(sessionId?: string, runResult?: RunResult, effortLevel?: 
       usage.cache_read_input_tokens +
       usage.cache_creation_input_tokens;
     const totalOutput = usage.output_tokens;
-    const costStr = cost_usd < 0.001 ? "<$0.001" : `$${cost_usd.toFixed(3)}`;
+    // clark drives interactive `claude` on the subscription, so there is no
+    // per-turn API dollar cost — the runner reports cost_usd = 0. Only show a
+    // price when a runner actually reports one (> 0); otherwise omit it rather
+    // than printing a misleading "<$0.001" for a 100k-token Opus turn.
+    const costStr = cost_usd > 0 ? ` · $${cost_usd.toFixed(3)}` : "";
     const effortStr = effortLevel ? ` · effort: ${effortLevel}` : "";
     let ctxStr = "";
     if (context_window && context_used != null && context_window > 0) {
       const pct = Math.round((context_used / context_window) * 100);
       ctxStr = ` · ctx:${pct}%`;
     }
-    parts.push(`${model}${effortStr} · ↑ ${totalInput.toLocaleString()} ↓ ${totalOutput.toLocaleString()} tokens · ${costStr}${ctxStr}`);
+    parts.push(`${model}${effortStr} · ↑ ${totalInput.toLocaleString()} ↓ ${totalOutput.toLocaleString()} tokens${costStr}${ctxStr}`);
   }
   if (sessionId) {
     parts.push(`sid:${sessionId.slice(0, 8)}`);

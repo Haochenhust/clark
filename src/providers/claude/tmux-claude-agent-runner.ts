@@ -84,10 +84,19 @@ const RESPONSE_GRACE_MS = parseInt(getEnv("CLARK_TMUX_RESPONSE_GRACE_MS", "30000
  * sentinel, so breaking immediately drops the actual answer.
  */
 const STOP_DRAIN_MS = parseInt(getEnv("CLARK_TMUX_STOP_DRAIN_MS", "1500"), 10);
-/** Hard ceiling on a single turn. */
-const TURN_TIMEOUT_MS = parseInt(getEnv("CLARK_TMUX_TURN_TIMEOUT_MS", "600000"), 10);
+/** Optional hard ceiling on a single turn, in ms. Default 0 = NO limit — tasks
+ * may run arbitrarily long (a deep agentic turn can take many minutes). Set
+ * CLARK_TMUX_TURN_TIMEOUT_MS > 0 only if you want a backstop. The grace check
+ * below is separate: it fails fast when a turn never STARTS (lost injection),
+ * and never fires once a turn is underway, so it does not cap duration. */
+const TURN_TIMEOUT_MS = parseInt(getEnv("CLARK_TMUX_TURN_TIMEOUT_MS", "0"), 10);
 /** Pause after pasting the prompt before sending Enter, so Ink absorbs the paste. */
 const INJECT_ENTER_DELAY_MS = parseInt(getEnv("CLARK_TMUX_INJECT_ENTER_DELAY_MS", "200"), 10);
+/** If no real turn starts within this long after an inject, re-inject (the paste
+ * was likely lost because the TUI wasn't ready — common on slow session resume). */
+const REINJECT_WAIT_MS = parseInt(getEnv("CLARK_TMUX_REINJECT_WAIT_MS", "6000"), 10);
+/** Max prompt injection attempts (initial + retries) before giving up the turn. */
+const MAX_INJECT_ATTEMPTS = parseInt(getEnv("CLARK_TMUX_MAX_INJECT_ATTEMPTS", "3"), 10);
 
 /**
  * Env vars unset before launching the pane's `claude`. They're only present
@@ -190,21 +199,15 @@ interface RunState {
 }
 
 /**
- * Parse one Claude Code transcript (.jsonl) line into our message shape.
+ * Parse one already-parsed Claude Code transcript object into our message shape.
  * Returns null for line types we don't surface (attachment, skill_listing,
  * hook_success, the user's own prompt echo, summaries, etc.).
  */
-function parseJsonlLine(
-  line: string,
+function parseTranscriptObj(
+  obj: any,
   sessionId: string,
   state: RunState,
 ): SystemMessage | AssistantMessage | ToolMessage | null {
-  let obj: any;
-  try {
-    obj = JSON.parse(line);
-  } catch {
-    return null;
-  }
   const type = obj?.type;
 
   if (type === "system") {
@@ -346,30 +349,46 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
       let transcript = findTranscriptById(sessionId);
       let baselineLines = transcript ? countCompleteLines(readFileSync(transcript, "utf-8")) : 0;
 
-      // Inject the prompt via bracketed paste, then Enter. A prompt starting
-      // with `!` would be taken as a bash command by the interactive TUI (even
-      // under bracketed paste), so prepend a space to neutralize it.
+      // Inject the prompt. A prompt starting with `!` would be taken as a bash
+      // command by the interactive TUI (even under bracketed paste), so prepend
+      // a space to neutralize it.
       checkAbort();
       const injectPrompt = prompt.startsWith("!") ? ` ${prompt}` : prompt;
       writeFileSync(promptFile, injectPrompt);
-      await tmux(["load-buffer", "-b", "clark", promptFile]);
-      await tmux(["paste-buffer", "-b", "clark", "-p", "-d", "-t", name]);
-      // Give Ink a beat to absorb the bracketed paste before submitting,
-      // otherwise Enter can race the paste and the prompt sits unsubmitted.
-      await sleep(INJECT_ENTER_DELAY_MS);
-      await tmux(["send-keys", "-t", name, "Enter"]);
+      // One injection = clear the input (C-u, neutralizes any partial text a
+      // prior attempt left — Ctrl-U reliably empties claude's input box), (re)load
+      // and bracketed-paste the prompt, pause so Ink absorbs the paste, then Enter.
+      // Reused for the initial inject and for re-injection (see the loop below).
+      const injectOnce = async () => {
+        await tmux(["send-keys", "-t", name, "C-u"]);
+        await tmux(["load-buffer", "-b", "clark", promptFile]);
+        await tmux(["paste-buffer", "-b", "clark", "-p", "-d", "-t", name]);
+        await sleep(INJECT_ENTER_DELAY_MS);
+        await tmux(["send-keys", "-t", name, "Enter"]);
+      };
+      await injectOnce();
+      let lastInjectAt = Date.now();
+      let injectAttempts = 1;
       logger.debug({ session_id: sessionId, bytes: prompt.length }, "prompt injected");
       const injectedAt = Date.now();
 
       // Tail the transcript and watch for the Stop sentinel.
       let done = false;
-      let sawContent = false;
+      // Flips true only when a REAL user-echo / assistant line appears — NOT on
+      // resume startup metadata (mode / permission-mode / file-history-snapshot),
+      // which grows the file but would otherwise defeat the grace check below.
+      let sawTurnStart = false;
       let drainUntil = 0;
       let loggedTranscript = false;
+      let failureText: string | null = null;
       while (true) {
         checkAbort();
-        if (Date.now() - launchedAt > TURN_TIMEOUT_MS) {
-          logger.warn({ session_id: sessionId }, "turn timeout — abandoning");
+        if (TURN_TIMEOUT_MS > 0 && Date.now() - launchedAt > TURN_TIMEOUT_MS) {
+          const mins = Math.round(TURN_TIMEOUT_MS / 60000);
+          logger.warn({ session_id: sessionId, sawTurnStart }, "turn timeout — abandoning");
+          failureText = sawTurnStart
+            ? `⚠️ 这条消息处理超过 ${mins} 分钟，已中止。可以重试，或把任务拆小一点。`
+            : `⚠️ 等了 ${mins} 分钟也没能把消息送达 Claude（可能注入失败），请重发一次。`;
           break;
         }
 
@@ -385,10 +404,18 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
           for (let i = baselineLines; i < complete.length; i++) {
             const line = complete[i]?.trim();
             if (!line) continue;
-            const parsed = parseJsonlLine(line, sessionId, state);
+            let obj: any;
+            try {
+              obj = JSON.parse(line);
+            } catch {
+              continue;
+            }
+            // A real user-echo / assistant line proves the injected turn actually
+            // started; startup metadata does not, so it can't mask a lost prompt.
+            if (obj?.type === "user" || obj?.type === "assistant") sawTurnStart = true;
+            const parsed = parseTranscriptObj(obj, sessionId, state);
             if (parsed) yield parsed;
           }
-          if (complete.length > baselineLines) sawContent = true;
           baselineLines = complete.length;
         }
 
@@ -398,20 +425,45 @@ export class TmuxClaudeAgentRunner implements AgentRunner {
           if (Date.now() >= drainUntil) break;
         } else if (existsSync(sentinel)) {
           // Turn finished; keep tailing briefly for the late-flushed final line.
-          logger.debug({ session_id: sessionId, baselineLines, sawContent }, "stop sentinel seen; draining");
+          logger.debug({ session_id: sessionId, baselineLines, sawTurnStart }, "stop sentinel seen; draining");
           done = true;
           drainUntil = Date.now() + STOP_DRAIN_MS;
-        } else if (!sawContent && Date.now() - injectedAt > RESPONSE_GRACE_MS) {
-          // Fail fast if claude produced nothing this turn (bad login, lost prompt,
-          // or a resumed session that forked to a different transcript id).
-          throw new Error(
-            "claude produced no transcript output for this turn — check that `claude` is logged in, " +
-              "tmux input reached the pane, and the resumed session id matches its transcript",
-          );
+        } else if (
+          !sawTurnStart &&
+          injectAttempts < MAX_INJECT_ATTEMPTS &&
+          Date.now() - lastInjectAt > REINJECT_WAIT_MS
+        ) {
+          // The prompt produced no turn — likely a lost paste because the TUI
+          // wasn't ready (common on slow session resume). Re-inject (clearing
+          // any partial input first) before the grace window gives up.
+          injectAttempts++;
+          logger.warn({ session_id: sessionId, attempt: injectAttempts }, "no turn started — re-injecting prompt");
+          await injectOnce();
+          lastInjectAt = Date.now();
+        } else if (!sawTurnStart && Date.now() - injectedAt > RESPONSE_GRACE_MS) {
+          // No real turn started within the grace window despite re-injection —
+          // the prompt never reached claude (not logged in, forked session id,
+          // pane wedged). Don't hang: surface a retry hint and finish the turn.
+          logger.warn({ session_id: sessionId }, "no turn started within grace — injection failed");
+          failureText = "⚠️ 没能把你的消息送达 Claude（注入失败），请再发一次。";
+          break;
         }
         await sleep(TAIL_POLL_MS);
       }
-      logger.debug({ session_id: sessionId, sawContent, baselineLines }, "turn loop exit");
+      logger.debug({ session_id: sessionId, sawTurnStart, baselineLines }, "turn loop exit");
+
+      // Guarantee the user always hears back: on timeout / lost-prompt, emit a
+      // synthetic assistant message so it flows through the normal delivery path
+      // instead of failing silently.
+      if (failureText) {
+        const notice: AssistantMessage = {
+          id: randomUUID(),
+          session_id: sessionId,
+          role: "assistant",
+          content: [{ type: "text", text: failureText }],
+        };
+        yield notice;
+      }
 
       const result: RunResult = {
         type: "run_result",

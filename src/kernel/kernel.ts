@@ -16,7 +16,6 @@ import {
   type ScheduledTaskPayload,
 } from "@/sys";
 
-import { splitMarkdownBySize } from "@/providers/feishu/messaging/message-renderer";
 import { MultiChannelMessageGateway } from "./messaging";
 import { SessionManager } from "./sessioning";
 import * as sessioningSchema from "./sessioning/data";
@@ -306,16 +305,18 @@ class Kernel {
       chatId,
     });
 
-    const contents: AssistantMessage["content"] = [];
-    let lastMessage: AssistantMessage | undefined;
     let runResult: RunResult | undefined;
 
-    // --- Live streaming card state (per design/feishu-streaming-design.md §4) ---
-    //   progressLines buffered from the content stream, throttled per (category,
-    //   key) at 5 s and deduped against the immediately previous line. A single
-    //   Feishu card is POSTed on first progress, PATCHed at most every
-    //   PATCH_MIN_INTERVAL_MS while content arrives, and finalized via the
-    //   channel's full render pipeline at turn-end.
+    // Streaming delivery: ONE live Feishu card per turn. The "process" — every
+    // assistant message except the last: its narration text + its tool/thinking
+    // steps — is folded into the card's collapsible "execution steps" dropdown
+    // and updated in real time; only the FINAL assistant message renders in the
+    // card body. We only know which message is last when the stream ends, hence
+    // the one-message buffer: each message is folded into the dropdown once the
+    // next arrives, and whatever is still buffered at the end is the final answer.
+    let bufferedAssistant: AssistantMessage | undefined;
+
+    // --- Live card state ---
     const PATCH_MIN_INTERVAL_MS = 1500;
     const PROGRESS_THROTTLE_MS = 5000;
     const turnStartedAt = Date.now();
@@ -342,6 +343,20 @@ class Kernel {
       progressLines.push(extracted.line);
     };
 
+    // Fold a confirmed-intermediate message into the process dropdown, in block
+    // order: its narration text becomes a process line, its tool/thinking blocks
+    // go through ingestProgress. (extractProgressLine intentionally skips text.)
+    const foldIntoProcess = (msg: AssistantMessage) => {
+      for (const block of msg.content) {
+        if (block.type === "text") {
+          const t = block.text.trim();
+          if (t) progressLines.push(t);
+        } else {
+          ingestProgress(block);
+        }
+      }
+    };
+
     const buildCardForState = (state: LiveCardState, finalText?: string) =>
       buildLiveCard({
         progressLines,
@@ -355,11 +370,6 @@ class Kernel {
 
     const postInitialCard = () => {
       writeChain = writeChain.then(async () => {
-        // POST unconditionally on first assistant-content arrival so every
-        // turn gets the unified live-card UX — even short chats that produce
-        // no progress lines (e.g. an empty thinking block + a text answer).
-        // Without this, those turns used to fall back to the legacy reply
-        // path, showing an awkward empty "Show 1 step" panel.
         if (liveCardMessageId) return;
         try {
           const card = buildCardForState("running");
@@ -409,11 +419,13 @@ class Kernel {
       const stream = await session.stream(inboundMessage, { signal });
       for await (const message of stream) {
         if ("role" in message && message.role === "assistant") {
-          contents.push(...message.content);
-          lastMessage = message;
-          for (const block of message.content) {
-            ingestProgress(block);
+          // The previously-buffered message is now confirmed intermediate → fold
+          // it into the process dropdown. The new message becomes the running
+          // candidate for the final answer (card body).
+          if (bufferedAssistant) {
+            foldIntoProcess(bufferedAssistant);
           }
+          bufferedAssistant = message;
           onContentAppended();
         } else if ("type" in message && message.type === "run_result") {
           runResult = message;
@@ -426,9 +438,8 @@ class Kernel {
         pendingPatchTimer = null;
       }
       await writeChain.catch(() => {});
-      // Try to mark the card as interrupted so the user isn't left staring at a
-      // "still running" state. Best-effort only — if this fails, the caller's
-      // error handling still runs below.
+      // Mark the card interrupted so the user isn't stuck on a "running" state
+      // (the abort path also sends its own "Task stopped." reply).
       if (liveCardMessageId) {
         const errorCard = buildCardForState("error", _formatErrorText(err));
         await this._messageGateway
@@ -436,9 +447,6 @@ class Kernel {
           .catch(() => {});
       }
       throw err;
-    }
-    if (!lastMessage) {
-      throw new Error("No assistant message received from the agent.");
     }
 
     // Drain any pending throttled PATCH before finalizing.
@@ -448,11 +456,19 @@ class Kernel {
     }
     await writeChain;
 
+    // The buffered message is the final answer → card body. Render only its text
+    // (its tool/thinking blocks, if any, were already folded into the dropdown).
+    const finalContent = bufferedAssistant
+      ? bufferedAssistant.content.filter((c) => c.type === "text")
+      : [];
     const finalAssistant: AssistantMessage = {
       id: liveCardMessageId ?? "",
       role: "assistant",
       session_id: session.id,
-      content: contents,
+      content:
+        finalContent.length > 0
+          ? finalContent
+          : [{ type: "text", text: "（本轮没有产生文字结论，过程见下方步骤）" }],
     };
 
     let finalized = false;
@@ -474,9 +490,8 @@ class Kernel {
       } catch (err) {
         this._logger.warn(
           { err, session_id: session.id, message_id: liveCardMessageId },
-          "final live card PATCH failed; falling back to chunked reply",
+          "final live card PATCH failed; falling back to plain reply",
         );
-        // Best-effort: mark the card as "done" so user doesn't see "处理中" forever
         const doneCard = buildCardForState("done", "完整回复见下方消息");
         await this._messageGateway
           .patchLiveCard(session.id, liveCardMessageId, doneCard)
@@ -485,47 +500,15 @@ class Kernel {
     }
 
     if (!finalized) {
-      // Either no live card was ever created (short-run turn) or the final
-      // PATCH failed. Split content into size-safe chunks and send as
-      // multiple reply messages so the user still gets the full answer.
-      const lastText = contents.findLast((c) => c.type === "text");
-      const replyOpts = {
-        streaming: false,
-        runResult,
-        effortLevel: config.agents.default.effortLevel,
-      };
-      if (lastText && lastText.type === "text") {
-        const chunks = splitMarkdownBySize(lastText.text, 8_000);
-        const nonTextContent = contents.filter((c) => c.type !== "text");
-        // First chunk: includes non-text content (thinking, tool_use) + first text chunk
-        await this._messageGateway.replyMessage(
-          inboundMessage.id,
-          {
-            role: "assistant",
-            session_id: session.id,
-            content: [...nonTextContent, { type: "text", text: chunks[0]! }],
-          },
-          replyOpts,
-        );
-        // Remaining chunks: text-only follow-up replies
-        for (let i = 1; i < chunks.length; i++) {
-          await this._messageGateway.replyMessage(
-            inboundMessage.id,
-            {
-              role: "assistant",
-              session_id: session.id,
-              content: [{ type: "text", text: chunks[i]! }],
-            },
-            { streaming: false },
-          );
-        }
-      } else {
-        await this._messageGateway.replyMessage(
-          inboundMessage.id,
-          { role: "assistant", session_id: session.id, content: contents },
-          replyOpts,
-        );
-      }
+      // No live card (initial POST failed) or the final PATCH failed — send the
+      // answer as a plain reply so the user still gets it (channel chunks it).
+      await this._messageGateway
+        .replyMessage(inboundMessage.id, finalAssistant, {
+          streaming: false,
+          runResult,
+          effortLevel: config.agents.default.effortLevel,
+        })
+        .catch(() => {});
     }
 
     // Remove the ⏱ reaction now that the reply is complete
