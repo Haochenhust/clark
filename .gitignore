@@ -8,10 +8,18 @@ node_modules/
 store/
 
 # Runtime workspace: the bot uses workspace/ as its cwd and writes uploads, logs,
-# and arbitrary scratch files there. Ignore everything EXCEPT the tracked template
-# — persona (CLAUDE.md), Claude config + skills (.claude/), and MCP config.
+# and arbitrary scratch files there. Ignore everything EXCEPT the tracked bot
+# framework — persona (CLAUDE.md + soul.md), memory + rules, Claude config +
+# skills (.claude/), and MCP config.
+#
+# NOTE: memory/ ships with generic templates, but the bot fills it with the
+# user's personal data at runtime. Review (or scrub) memory/ before pushing to a
+# public remote.
 workspace/*
 !workspace/CLAUDE.md
+!workspace/soul.md
+!workspace/memory/
+!workspace/rules/
 !workspace/.claude/
 !workspace/.mcp.json
 
