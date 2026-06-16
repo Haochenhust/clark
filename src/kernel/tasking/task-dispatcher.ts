@@ -536,6 +536,28 @@ export class TaskDispatcher {
    * Re-registers all persisted scheduled tasks with bunqueue.
    */
   async start() {
+    // On (re)start nothing from a previous run can still be executing — any row
+    // left "running" is a ghost whose owning process is gone. Reconcile so the
+    // tasks table is honest and getRunningTaskForSession can't hand /stop or /new
+    // a stale task. (This also clears panes-era zombies like a turn that wedged
+    // before the bounded monitor existed.)
+    const stale = this._db
+      .select({ id: tasks.id })
+      .from(tasks)
+      .where(eq(tasks.status, "running"))
+      .all();
+    if (stale.length > 0) {
+      this._db
+        .update(tasks)
+        .set({ status: "cancelled", updated_at: Date.now() })
+        .where(eq(tasks.status, "running"))
+        .run();
+      this._logger.info(
+        { count: stale.length },
+        "reconciled stale running tasks on startup",
+      );
+    }
+
     await this.reloadScheduledTasks();
 
     this._worker = new Worker<TaskJobData>(

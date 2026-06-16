@@ -404,14 +404,38 @@ export class WarmPaneManager {
   }
 
   /**
-   * Tear down the warm pane (used by `/new`). The next message spawns a fresh one.
-   * Safe to call while a turn is in flight: the in-flight monitor sees the pane
-   * die and ends as `dead`; the identity guard in `_settle` avoids clobbering.
+   * Tear down EVERY clark-* pane (the tracked one plus any orphan) and SIGKILL
+   * their claude processes. Used at startup and on `/new` — both are hard resets
+   * where no pane may survive. Killing by the exact pane PID is what makes this
+   * reliable: `kill-session` alone leaves claude lingering a few seconds (we kept
+   * getting fooled by that), so we also signal the process directly. Safe to call
+   * mid-flight: an in-flight monitor sees its pane die and ends as `dead`.
    */
-  async reset(): Promise<void> {
-    const pane = this._pane;
+  async killAllPanes(): Promise<void> {
     this._pane = null;
-    if (pane) await this._teardown(pane).catch(() => {});
+    const out = (await tmux(["list-panes", "-a", "-F", "#{session_name} #{pane_pid}"])).stdout;
+    const targets: Array<{ name: string; pid: number }> = [];
+    for (const line of out.split("\n")) {
+      const parts = line.trim().split(/\s+/);
+      const name = parts[0];
+      if (!name || !name.startsWith("clark-")) continue;
+      const pid = parseInt(parts[1] ?? "", 10);
+      targets.push({ name, pid: Number.isFinite(pid) ? pid : 0 });
+    }
+    for (const t of targets) {
+      await killPane(t.name);
+      // pid 0 would signal the whole process group — never do that; guard with `if`.
+      if (t.pid) {
+        try {
+          process.kill(t.pid, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+    if (targets.length > 0) {
+      this._logger.info({ count: targets.length }, "reset: killed all clark panes + claude procs");
+    }
   }
 
   // --- pane lifecycle ---

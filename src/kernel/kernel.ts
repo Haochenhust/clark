@@ -90,33 +90,12 @@ class Kernel {
   }
 
   /**
-   * Kill stale clark tmux panes left over from a previous run. The interactive
-   * runner names each pane "clark-<sessionId>"; any such session is orphaned
-   * once this process restarts, so tear them all down. Tolerates tmux being
-   * absent (no server / not installed).
+   * Kill every stale clark-* pane (and its claude process) left over from a
+   * previous run. Delegates to the warm-pane manager's reliable kill-by-PID sweep
+   * (awaited, so cleanup is done before the first turn can spawn a fresh pane).
    */
   private async _killOrphanedAgentProcesses(): Promise<void> {
-    try {
-      const list = Bun.spawnSync(["tmux", "list-sessions", "-F", "#{session_name}"]);
-      if (list.exitCode !== 0) return; // no tmux server / no sessions
-      const names = list.stdout
-        .toString()
-        .split("\n")
-        .map((n) => n.trim())
-        .filter((n) => n.startsWith("clark-"));
-      for (const name of names) {
-        Bun.spawn(["tmux", "kill-session", "-t", name]);
-      }
-      if (names.length > 0) {
-        this._logger.info(
-          { count: names.length },
-          "Killed orphaned clark tmux panes from previous run",
-        );
-        await Bun.sleep(1000);
-      }
-    } catch {
-      /* tmux not installed — safe to ignore */
-    }
+    await warmPane.killAllPanes();
   }
 
   private _initLarkCliConfig(): void {
@@ -265,7 +244,7 @@ class Kernel {
         await this._taskDispatcher.deleteTask(runningTaskId).catch(() => {});
       }
     }
-    await warmPane.reset();
+    await warmPane.killAllPanes();
     this._sessionManager.clearChatSession(chatId);
     await this._messageGateway.replyMessage(
       message.id,
