@@ -151,6 +151,10 @@ export class TaskDispatcher {
         updated_at: now,
       })
       .run();
+    this._logger.info(
+      { job_id: job.id, session_id: sessionId, type: payload.type },
+      "dispatched task to bunqueue",
+    );
     return job.id;
   }
 
@@ -551,6 +555,18 @@ export class TaskDispatcher {
     );
     this._worker.on("error", (err) => {
       this._logger.error({ err }, "worker error");
+    });
+    this._worker.on("completed", (job: any) => {
+      this._logger.info({ job_id: job?.id }, "bunqueue: job completed");
+    });
+    this._worker.on("failed", (job: any, err: any) => {
+      this._logger.error({ job_id: job?.id, err: err?.message }, "bunqueue: job failed");
+    });
+    this._worker.on("stalled", (jobId: any) => {
+      this._logger.warn({ job_id: jobId }, "bunqueue: job stalled");
+    });
+    this._worker.on("drained", () => {
+      this._logger.info("bunqueue: queue drained");
     });
     this._logger.info(
       "Task dispatcher started with concurrency: " + this._concurrency,

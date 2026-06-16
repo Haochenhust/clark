@@ -329,24 +329,25 @@ function _formatToolUse(content: ToolUseMessageContent): string | null {
 function _renderFooter(sessionId?: string, runResult?: RunResult, effortLevel?: string): DivElement {
   const parts: string[] = [];
   if (runResult) {
-    const { model, cost_usd, usage, context_window, context_used } = runResult;
+    const { model, usage, context_window, context_used } = runResult;
     const totalInput =
       usage.input_tokens +
       usage.cache_read_input_tokens +
       usage.cache_creation_input_tokens;
     const totalOutput = usage.output_tokens;
-    // clark drives interactive `claude` on the subscription, so there is no
-    // per-turn API dollar cost — the runner reports cost_usd = 0. Only show a
-    // price when a runner actually reports one (> 0); otherwise omit it rather
-    // than printing a misleading "<$0.001" for a 100k-token Opus turn.
-    const costStr = cost_usd > 0 ? ` · $${cost_usd.toFixed(3)}` : "";
     const effortStr = effortLevel ? ` · effort: ${effortLevel}` : "";
+    // Session context consumption — the latest turn's input + cache tokens, i.e.
+    // how full the model's context window currently is (absolute, plus a % when
+    // the window size is known). No dollar cost is shown: clark runs on the
+    // Claude Code subscription, so there is no per-turn API charge.
     let ctxStr = "";
-    if (context_window && context_used != null && context_window > 0) {
-      const pct = Math.round((context_used / context_window) * 100);
-      ctxStr = ` · ctx:${pct}%`;
+    if (context_used != null) {
+      ctxStr = ` · ctx: ${(context_used / 1000).toFixed(1)}k`;
+      if (context_window && context_window > 0) {
+        ctxStr += ` (${Math.round((context_used / context_window) * 100)}%)`;
+      }
     }
-    parts.push(`${model}${effortStr} · ↑ ${totalInput.toLocaleString()} ↓ ${totalOutput.toLocaleString()} tokens${costStr}${ctxStr}`);
+    parts.push(`${model}${effortStr} · ↑ ${totalInput.toLocaleString()} ↓ ${totalOutput.toLocaleString()} tokens${ctxStr}`);
   }
   if (sessionId) {
     parts.push(`sid:${sessionId.slice(0, 8)}`);
