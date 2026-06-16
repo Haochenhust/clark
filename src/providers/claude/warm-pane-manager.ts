@@ -78,14 +78,18 @@ const RESPONSE_GRACE_MS = parseInt(getEnv("CLARK_TMUX_RESPONSE_GRACE_MS", "30000
 /** After the Stop sentinel fires, keep tailing this long to drain the final line. */
 const STOP_DRAIN_MS = parseInt(getEnv("CLARK_TMUX_STOP_DRAIN_MS", "1500"), 10);
 /**
- * ★ The key deadlock guard: if a turn has started but the transcript stops
- * growing for this long (no tool calls, no thinking, no text — total silence),
- * the turn is considered wedged and abandoned. Bounds IDLE time, not total time,
- * so a genuinely long agentic turn is fine as long as it keeps emitting anything.
+ * The deadlock guard: a turn is "wedged" only when it shows NO sign of life for
+ * this long — no transcript growth AND the claude process tree burns no CPU. A
+ * genuinely long task (compile / deep think / download) keeps the tree busy, so
+ * it is never killed merely for taking a while; only a tool hung on a dead socket
+ * (idle tree) trips this. There is deliberately NO hard total-time ceiling — a
+ * runaway that keeps burning CPU is left for the user to `/stop`.
  */
-const TURN_IDLE_MS = parseInt(getEnv("CLARK_TURN_IDLE_MS", "90000"), 10);
-/** Absolute ceiling on a single turn, regardless of progress. Backstop. */
-const TURN_MAX_MS = parseInt(getEnv("CLARK_TURN_MAX_MS", "900000"), 10);
+const NO_LIFE_MS = parseInt(getEnv("CLARK_TURN_NO_LIFE_MS", "300000"), 10);
+/** How often to sample process-tree CPU (cheaper than every tail poll). */
+const CPU_PROBE_MS = parseInt(getEnv("CLARK_CPU_PROBE_MS", "5000"), 10);
+/** Tree CPU% above this counts as "doing real work" → resets the no-life clock. */
+const CPU_ACTIVE_PCT = parseFloat(getEnv("CLARK_CPU_ACTIVE_PCT", "2"));
 /** Per tmux subcommand timeout — so a wedged tmux server can't hang us. */
 const TMUX_CMD_MS = parseInt(getEnv("CLARK_TMUX_CMD_TIMEOUT_MS", "5000"), 10);
 /** Grace for a `/exit` to land before we SIGKILL the pane during teardown. */
@@ -161,6 +165,63 @@ async function killPane(name: string): Promise<void> {
 
 async function sendKey(name: string, key: string): Promise<void> {
   await tmux(["send-keys", "-t", name, key]);
+}
+
+/**
+ * Sum %CPU across a process and all its descendants (the pane's claude plus any
+ * tool subprocesses — bash, web browser, MCP servers). Used as a liveness signal:
+ * a genuine long task keeps some of the tree busy; a tool hung on a dead socket
+ * leaves the whole tree at ~0%. Returns 0 on any error (treated as "no CPU").
+ */
+async function treeCpuPercent(rootPid: number): Promise<number> {
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(["ps", "-axo", "pid=,ppid=,pcpu="], { stdout: "pipe", stderr: "pipe" });
+  } catch {
+    return 0;
+  }
+  const timer = setTimeout(() => {
+    try {
+      proc.kill();
+    } catch {
+      /* already gone */
+    }
+  }, 5000);
+  let out: string;
+  try {
+    out = await new Response(proc.stdout as ReadableStream<Uint8Array>).text();
+    await proc.exited;
+  } catch {
+    return 0;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const kids = new Map<number, number[]>();
+  const pct = new Map<number, number>();
+  for (const line of out.split("\n")) {
+    const m = line.trim().split(/\s+/);
+    if (m.length < 3) continue;
+    const pid = parseInt(m[0] ?? "", 10);
+    const ppid = parseInt(m[1] ?? "", 10);
+    const cpu = parseFloat(m[2] ?? "");
+    if (!Number.isFinite(pid)) continue;
+    pct.set(pid, Number.isFinite(cpu) ? cpu : 0);
+    if (!kids.has(ppid)) kids.set(ppid, []);
+    kids.get(ppid)!.push(pid);
+  }
+
+  let total = 0;
+  const seen = new Set<number>();
+  const stack = [rootPid];
+  while (stack.length) {
+    const p = stack.pop()!;
+    if (seen.has(p)) continue;
+    seen.add(p);
+    total += pct.get(p) ?? 0;
+    for (const c of kids.get(p) ?? []) stack.push(c);
+  }
+  return total;
 }
 
 /**
@@ -275,6 +336,8 @@ interface WarmPane {
   sentinel: string;
   settingsPath: string;
   promptFile: string;
+  /** PID of the claude process in the pane — root of the CPU liveness probe. */
+  panePid?: number;
 }
 
 /** The terminal state of one turn. Everything except `done` is a bounded exit. */
@@ -282,7 +345,6 @@ type TurnOutcome =
   | { kind: "done" }
   | { kind: "dead"; failureText: string }
   | { kind: "stalled"; failureText: string }
-  | { kind: "timeout"; failureText: string }
   | { kind: "inject_fail"; failureText: string }
   | { kind: "aborted" };
 
@@ -428,6 +490,11 @@ export class WarmPaneManager {
       throw new Error(`tmux new-session failed: ${created.stderr.trim()}`);
     }
     await this._waitUntilReady(name, options.signal);
+    // Record the pane's process (claude, after the shell exec'd into it) so the
+    // monitor's CPU liveness probe knows which tree to watch.
+    const pidLine = (await tmux(["list-panes", "-t", name, "-F", "#{pane_pid}"])).stdout.trim();
+    const pid = parseInt(pidLine.split("\n")[0] ?? "", 10);
+    if (Number.isFinite(pid)) pane.panePid = pid;
     return pane;
   }
 
@@ -471,7 +538,8 @@ export class WarmPaneManager {
     let transcript = findTranscriptById(pane.sessionId);
     let baselineLines = baseline;
     let sawTurnStart = false;
-    let lastProgressAt = Date.now();
+    let lastLiveAt = Date.now();
+    let lastCpuProbeAt = 0;
     const injectedAt = Date.now();
     let lastInjectAt = injectedAt;
     let injectAttempts = 1;
@@ -484,7 +552,7 @@ export class WarmPaneManager {
       if (!transcript) transcript = findTranscriptById(pane.sessionId);
       if (transcript) {
         const complete = readFileSync(transcript, "utf-8").split("\n").slice(0, -1);
-        if (complete.length > baselineLines) lastProgressAt = Date.now(); // progress!
+        if (complete.length > baselineLines) lastLiveAt = Date.now(); // new transcript = real progress
         for (let i = baselineLines; i < complete.length; i++) {
           const line = complete[i]?.trim();
           if (!line) continue;
@@ -501,6 +569,15 @@ export class WarmPaneManager {
         baselineLines = complete.length;
       }
 
+      // Liveness probe (every CPU_PROBE_MS, cheaper than the tail poll): if the
+      // claude process tree is burning CPU, real work is happening → stay alive.
+      // Combined with transcript growth above, this lets a long-but-working turn
+      // run indefinitely while still catching a tool hung on a dead socket.
+      if (sawTurnStart && pane.panePid && Date.now() - lastCpuProbeAt > CPU_PROBE_MS) {
+        lastCpuProbeAt = Date.now();
+        if ((await treeCpuPercent(pane.panePid)) > CPU_ACTIVE_PCT) lastLiveAt = Date.now();
+      }
+
       if (done) {
         if (Date.now() >= drainUntil) return { kind: "done" };
       } else if (existsSync(pane.sentinel)) {
@@ -509,14 +586,10 @@ export class WarmPaneManager {
         drainUntil = Date.now() + STOP_DRAIN_MS;
       } else if (!(await paneAlive(pane.name))) {
         return { kind: "dead", failureText: "⚠️ Claude 进程已退出，本轮中断，请重发一次。" };
-      } else if (sawTurnStart && Date.now() - lastProgressAt > TURN_IDLE_MS) {
-        const secs = Math.round(TURN_IDLE_MS / 1000);
-        this._logger.warn({ session_id: pane.sessionId }, "turn stalled — no output");
-        return { kind: "stalled", failureText: `⚠️ 这条消息卡住了（${secs}s 无输出），已中止。可以重试，或把任务拆小一点。` };
-      } else if (Date.now() - injectedAt > TURN_MAX_MS) {
-        const mins = Math.round(TURN_MAX_MS / 60000);
-        this._logger.warn({ session_id: pane.sessionId }, "turn hit hard deadline");
-        return { kind: "timeout", failureText: `⚠️ 这条消息处理超过 ${mins} 分钟，已中止。可以重试或拆小。` };
+      } else if (sawTurnStart && Date.now() - lastLiveAt > NO_LIFE_MS) {
+        const mins = Math.round(NO_LIFE_MS / 60000);
+        this._logger.warn({ session_id: pane.sessionId }, "turn wedged — no progress and no CPU");
+        return { kind: "stalled", failureText: `⚠️ 这条消息卡住了（约 ${mins} 分钟无任何进展、进程也没有活动），已中止。可以重试，或把任务拆小一点。` };
       } else if (
         !sawTurnStart &&
         injectAttempts < MAX_INJECT_ATTEMPTS &&
@@ -556,7 +629,7 @@ export class WarmPaneManager {
       if (this._pane === pane) this._pane = null;
       return;
     }
-    // stalled | timeout | inject_fail | aborted → claude may be mid-turn; interrupt it.
+    // stalled | inject_fail | aborted → claude may be mid-turn; interrupt it.
     const recovered = await this._interruptToIdle(pane);
     if (!recovered) {
       await this._teardown(pane);
