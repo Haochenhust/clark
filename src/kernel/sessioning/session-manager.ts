@@ -48,10 +48,11 @@ export interface SessionResolveOptions {
 }
 
 /**
- * Time-to-live for a chat→session binding. After this window elapses with no
- * activity, the binding is considered stale and a fresh session is started.
+ * Time-to-live for a chat→session binding. In the v2 warm-pane model the binding
+ * (like the warm pane itself) persists until the user explicitly runs `/new`, so
+ * there is no idle expiry — the conversation stays continuous indefinitely.
  */
-const CHAT_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const CHAT_SESSION_TTL_MS = Number.POSITIVE_INFINITY;
 
 /**
  * Creates or resumes Session instances. Session metadata is stored in the

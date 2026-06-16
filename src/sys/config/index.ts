@@ -83,8 +83,9 @@ export const config: Config = {
     get max_retries() {
       return 1;
     },
+    // v2 warm-pane model is strictly serial: one warm pane, one turn at a time.
     get concurrency() {
-      return parseInt(getEnv("MAX_CONCURRENT_AGENTS", "5"));
+      return parseInt(getEnv("MAX_CONCURRENT_AGENTS", "1"));
     },
   },
   paths,

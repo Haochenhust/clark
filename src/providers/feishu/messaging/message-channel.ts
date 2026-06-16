@@ -10,6 +10,7 @@ import type { Logger, TextMessageContent } from "@/sys";
 import {
   config,
   createLogger,
+  getEnv,
   type AssistantMessage,
   type MessageChannel,
   type MessageChannelEventTypes,
@@ -106,6 +107,22 @@ export class FeishuMessageChannel
       appId: this._appId,
       appSecret: this._appSecret,
     });
+    // The Lark SDK's default axios instance ships with NO request timeout
+    // (verified: defaults.timeout === 0), so a stalled Feishu call would hang the
+    // caller forever — a deadlock on the strictly-serial turn queue. Add a hard
+    // request timeout to the EXISTING instance (NOT a replacement, which would
+    // drop the SDK's response-unwrap interceptor); axios then aborts the socket
+    // and rejects, and the existing try/catch fallbacks treat it as a normal
+    // failure (mark card dead → plain reply, etc.).
+    const httpTimeoutMs = parseInt(getEnv("CLARK_FEISHU_HTTP_TIMEOUT_MS", "20000"), 10);
+    const outboundHttp = this._client.httpInstance as unknown as {
+      defaults?: { timeout?: number };
+    };
+    if (outboundHttp?.defaults) {
+      outboundHttp.defaults.timeout = httpTimeoutMs;
+    } else {
+      this._logger.warn("could not set Feishu HTTP timeout — SDK httpInstance has no axios defaults");
+    }
 
     // Clean up dedup table rows older than 7 days on startup, so the
     // feishu_processed_events table cannot grow unbounded.

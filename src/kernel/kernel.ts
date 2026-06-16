@@ -4,6 +4,7 @@ import {
   extractProgressLine,
   type LiveCardState,
 } from "@/providers/feishu";
+import { warmPane } from "@/providers/claude";
 import * as feishuMessagingSchema from "@/providers/feishu/messaging/data";
 import { DataConnection } from "@/data";
 import type { AssistantMessage, RunResult, UserMessage } from "@/sys";
@@ -255,6 +256,16 @@ class Kernel {
 
   private _handleNewSessionCommand = async (message: UserMessage) => {
     const chatId = this._extractChatId(message);
+    // Interrupt any in-flight turn for this chat's session, then tear down the
+    // warm pane so the next message starts a fresh interactive `claude` session.
+    const sessionId = this._sessionManager.getChatSession(chatId);
+    if (sessionId) {
+      const runningTaskId = this._taskDispatcher.getRunningTaskForSession(sessionId);
+      if (runningTaskId) {
+        await this._taskDispatcher.deleteTask(runningTaskId).catch(() => {});
+      }
+    }
+    await warmPane.reset();
     this._sessionManager.clearChatSession(chatId);
     await this._messageGateway.replyMessage(
       message.id,
