@@ -55,7 +55,6 @@ interface FinalLiveCardOpts {
   elapsedMs: number;
   state: Exclude<LiveCardState, "running">;
   runResult?: import("@/sys").RunResult;
-  effortLevel?: string;
 }
 
 /** Message channel implementation for Feishu (Lark) chat platform. */
@@ -146,7 +145,7 @@ export class FeishuMessageChannel
   async replyMessage(
     messageId: string,
     message: Omit<AssistantMessage, "id">,
-    { streaming = true, runResult, effortLevel }: { streaming?: boolean } & RunMetadata = {},
+    { streaming = true, runResult }: { streaming?: boolean } & RunMetadata = {},
   ): Promise<AssistantMessage> {
     const inThread = this._inThreadMessages.has(messageId);
     this._inThreadMessages.delete(messageId);
@@ -160,7 +159,6 @@ export class FeishuMessageChannel
       streaming,
       uploadImage: this.uploadImage.bind(this),
       runResult,
-      effortLevel,
       sessionId: message.session_id,
     });
     if (!streaming) {
@@ -361,7 +359,6 @@ export class FeishuMessageChannel
       streaming: false,
       uploadImage: this.uploadImage.bind(this),
       runResult: opts.runResult,
-      effortLevel: opts.effortLevel,
       sessionId: message.session_id,
     };
 
@@ -438,7 +435,7 @@ export class FeishuMessageChannel
   /** Update the content of an existing Feishu message. */
   async updateMessageContent(
     message: AssistantMessage,
-    { streaming = true, runResult, effortLevel }: { streaming?: boolean } & RunMetadata = {},
+    { streaming = true, runResult }: { streaming?: boolean } & RunMetadata = {},
   ): Promise<void> {
     if (this._failedCardUpdateMessages.has(message.id)) {
       return;
@@ -453,7 +450,6 @@ export class FeishuMessageChannel
       streaming,
       uploadImage: this.uploadImage.bind(this),
       runResult,
-      effortLevel,
       sessionId: message.session_id,
     });
     if (!streaming) {
@@ -476,7 +472,7 @@ export class FeishuMessageChannel
           "Feishu card update failed with 400; sending content as new reply",
         );
         const inThread = this._inThreadMessages.has(message.id);
-        await this._sendContentAsNewReply(message.id, message.content, runResult, effortLevel, inThread, message.session_id);
+        await this._sendContentAsNewReply(message.id, message.content, runResult, inThread, message.session_id);
         return;
       }
       throw err;
@@ -776,7 +772,6 @@ export class FeishuMessageChannel
     messageId: string,
     content: AssistantMessage["content"],
     runResult?: RunMetadata["runResult"],
-    effortLevel?: RunMetadata["effortLevel"],
     inThread: boolean = false,
     sessionId?: string,
   ): Promise<void> {
@@ -787,7 +782,6 @@ export class FeishuMessageChannel
         streaming: false,
         uploadImage: this.uploadImage.bind(this),
         runResult,
-        effortLevel,
         sessionId,
       });
       await this._client.im.message.reply({

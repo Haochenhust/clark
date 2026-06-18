@@ -298,6 +298,22 @@ export class SessionManager {
   }
 
   /**
+   * Reverse of {@link getChatSession}: the Feishu chat currently bound to a
+   * session id, or null if none. Used to deliver an autonomous turn (one clark
+   * did not initiate) back to the conversation it belongs to.
+   * @param sessionId - The Claude session id.
+   * @returns The bound chat id, or null if no chat is bound to this session.
+   */
+  getSessionChat(sessionId: string): string | null {
+    const row = this._db
+      .select()
+      .from(chatSessions)
+      .where(eq(chatSessions.session_id, sessionId))
+      .get();
+    return row?.chat_id ?? null;
+  }
+
+  /**
    * Binds a chat to a session, creating the mapping or updating an existing one,
    * and bumps `updated_at` so the TTL window restarts.
    * @param chatId - The Feishu chat id (open_id for DMs, chat_id for groups).

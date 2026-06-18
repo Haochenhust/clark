@@ -9,15 +9,20 @@ user-invocable: true
 
 # Restart clark
 
-Safely restart clark's main Bun process: confirm no OTHER conversation has an
-in-flight task, then use a detached script to SIGTERM the old process and start a
-fresh one.
+Safely restart clark: confirm no OTHER conversation has an in-flight task, then
+restart the process — via `launchctl kickstart` when clark runs as a launchd
+service (the common case), or a detached SIGTERM+relaunch when it runs standalone.
 
 ## Red lines
 
-- **Never bare `kill <pid>`** — that synchronously kills the current Claude Code
-  child (including you), and nothing restarts clark. Always use the detached
-  `nohup` pattern below.
+- **If clark is launchd-managed, NEVER `kill`+relaunch manually** — launchd auto-
+  respawns the killed process while your manual relaunch starts another, leaving
+  TWO instances that fight over the warm pane (`duplicate session: clark-…` →
+  "启动 Claude 失败" on every turn). Use `launchctl kickstart -k` instead — it
+  restarts the one managed instance in place. (This has actually happened.)
+- **Never bare `kill <pid>` synchronously** — it kills the current Claude Code
+  child (including you) before anything restarts clark. Always detach via the
+  `nohup` pattern below so the restart outlives this turn.
 - **If another conversation has a running/pending task, do NOT restart** — report
   it to the user and let them decide.
 
@@ -60,32 +65,48 @@ fi
 
 ## Execute the restart
 
+Detect how clark runs and restart accordingly. The 5s detached delay lets the
+final reply reach Feishu before the process (and this conversation) dies; `nohup`
++ `disown` + `< /dev/null` detach the restart from this (soon-to-die) process tree.
+
 ```bash
-PID=""
-if [ -f "$PID_FILE" ]; then
-  PID=$(cat "$PID_FILE")
-  ps -p "$PID" -o command= 2>/dev/null | grep -q "bun run index.ts" || PID=""
+# launchctl lists managed services as "PID  Status  Label"; column 3 is the label.
+LABEL=$(launchctl list 2>/dev/null | awk '/clark/ {print $3}' | head -1)
+
+if [ -n "$LABEL" ]; then
+  # launchd-managed (common case): kickstart restarts the ONE managed instance in
+  # place. NEVER kill+relaunch here — that races launchd's respawn into two
+  # fighting instances. The fresh boot's killAllPanes() sweeps any orphan pane.
+  TARGET="gui/$(id -u)/$LABEL"
+  nohup bash -c "sleep 5; launchctl kickstart -k '$TARGET'" >> "$LOG" 2>&1 < /dev/null &
+  disown
+  echo "Restart scheduled (launchctl kickstart -k $TARGET in 5s)."
+else
+  # Standalone: detached SIGTERM, then relaunch a fresh process.
+  PID=""
+  if [ -f "$PID_FILE" ]; then
+    PID=$(cat "$PID_FILE")
+    ps -p "$PID" -o command= 2>/dev/null | grep -q "bun run index.ts" || PID=""
+  fi
+  [ -z "$PID" ] && PID=$(pgrep -f "bun run index.ts" | head -1)
+  if [ -z "$PID" ]; then echo "Error: cannot find running clark process" >&2; exit 1; fi
+  nohup bash -c "
+    sleep 5
+    kill $PID
+    sleep 3
+    cd '$ROOT' && exec bun run index.ts
+  " >> "$LOG" 2>&1 < /dev/null &
+  disown
+  echo "Restart scheduled (standalone: SIGTERM $PID in 5s, then a fresh instance)."
 fi
-[ -z "$PID" ] && PID=$(pgrep -f "bun run index.ts" | head -1)
-if [ -z "$PID" ]; then echo "Error: cannot find running clark process" >&2; exit 1; fi
 
-nohup bash -c "
-  sleep 5
-  kill $PID
-  sleep 3
-  cd '$ROOT' && exec bun run index.ts
-" >> "$LOG" 2>&1 < /dev/null &
-disown
-
-echo "Restart scheduled (SIGTERM PID $PID in 5s, then a fresh instance)."
 echo "This conversation will end now; the new instance sends a boot notification."
 ```
 
-> The 5s delay lets the final reply reach Feishu. `nohup` + `disown` + `< /dev/null`
-> detach the restart from this (soon-to-die) process tree.
-
 ## Notes
 
-- The in-flight "restart" task can't be marked `completed` after SIGTERM and will
-  linger as `running`; this is inherent to self-restart and harmless.
+- `launchctl kickstart -k` SIGTERMs the running instance then starts it fresh; the
+  fresh boot's `killAllPanes()` sweeps any orphan warm pane, so clark comes back clean.
+- The in-flight "restart" task can't be marked `completed` after the process exits
+  and will linger as `running`; this is inherent to self-restart and harmless.
 - Restarting aborts all in-flight tasks (`dispatcher.stop()`), including this one.

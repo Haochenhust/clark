@@ -30,7 +30,6 @@ export interface LiveCardOptions {
   elapsedMs: number;
   state: LiveCardState;
   runResult?: RunResult;
-  effortLevel?: string;
   sessionId?: string;
 }
 
@@ -41,7 +40,7 @@ export interface LiveCardOptions {
  *  - Body (done):    collapsible_panel expanded=false + markdown result_body + footer
  */
 export function buildLiveCard(opts: LiveCardOptions): Card {
-  const { progressLines, finalText, elapsedMs, state, runResult, effortLevel, sessionId } =
+  const { progressLines, finalText, elapsedMs, state, runResult, sessionId } =
     opts;
 
   const elapsedStr = _formatElapsed(elapsedMs);
@@ -117,7 +116,7 @@ export function buildLiveCard(opts: LiveCardOptions): Card {
   }
 
   if (!isRunning && (runResult || sessionId)) {
-    card.body.elements.push(_renderFooter(sessionId, runResult, effortLevel));
+    card.body.elements.push(_renderFooter(sessionId, runResult));
   }
 
   if (isRunning) {
@@ -326,16 +325,16 @@ function _formatToolUse(content: ToolUseMessageContent): string | null {
   }
 }
 
-function _renderFooter(sessionId?: string, runResult?: RunResult, effortLevel?: string): DivElement {
+function _renderFooter(sessionId?: string, runResult?: RunResult): DivElement {
   const parts: string[] = [];
   if (runResult) {
-    const { model, usage, context_window, context_used } = runResult;
+    const { model, effort, usage, context_window, context_used } = runResult;
     const totalInput =
       usage.input_tokens +
       usage.cache_read_input_tokens +
       usage.cache_creation_input_tokens;
     const totalOutput = usage.output_tokens;
-    const effortStr = effortLevel ? ` · effort: ${effortLevel}` : "";
+    const effortStr = effort ? ` · effort: ${effort}` : "";
     // Session context consumption — the latest turn's input + cache tokens, i.e.
     // how full the model's context window currently is (absolute, plus a % when
     // the window size is known). No dollar cost is shown: clark runs on the

@@ -6,7 +6,6 @@ import type { AssistantMessage, UserMessage } from "./types";
 /** Metadata from a completed agent run, shown in the card footer. */
 export interface RunMetadata {
   runResult?: RunResult;
-  effortLevel?: string;
 }
 
 /** Event types emitted by a message channel. */

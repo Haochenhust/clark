@@ -160,7 +160,6 @@ export class MultiChannelMessageGateway
       elapsedMs: number;
       state: "done" | "error";
       runResult?: RunMetadata["runResult"];
-      effortLevel?: string;
     },
   ): Promise<void> {
     const channel = this._requireChannel();

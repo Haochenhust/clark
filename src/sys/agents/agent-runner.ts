@@ -25,6 +25,8 @@ export interface RunResult {
   context_window?: number;
   /** Last assistant turn's context size (input + cache_read + cache_creation). */
   context_used?: number;
+  /** Effort level the pane's `claude` was actually launched with (`--effort`). */
+  effort?: string;
 }
 
 /**

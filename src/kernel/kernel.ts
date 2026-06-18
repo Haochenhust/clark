@@ -77,6 +77,10 @@ class Kernel {
 
     this._messageGateway.on("message:inbound", this._handleInboundMessage);
     this._messageGateway.on("message:recalled", this._handleMessageRecall);
+
+    // Deliver turns Claude Code runs autonomously between clark's own turns — e.g.
+    // the doc link it produces after background subagents finish — to the bound chat.
+    warmPane.onOutOfBandTurn = this._deliverOutOfBandTurn;
   }
 
   async start(): Promise<void> {
@@ -354,7 +358,6 @@ class Kernel {
         elapsedMs: Date.now() - turnStartedAt,
         state,
         runResult: state === "running" ? undefined : runResult,
-        effortLevel: config.agents.default.effortLevel,
         sessionId,
       });
 
@@ -473,7 +476,6 @@ class Kernel {
             elapsedMs: Date.now() - turnStartedAt,
             state: "done",
             runResult,
-            effortLevel: config.agents.default.effortLevel,
           },
         );
         finalized = true;
@@ -496,7 +498,6 @@ class Kernel {
         .replyMessage(inboundMessage.id, finalAssistant, {
           streaming: false,
           runResult,
-          effortLevel: config.agents.default.effortLevel,
         })
         .catch(() => {});
     }
@@ -550,6 +551,45 @@ class Kernel {
     }
     (assistantMessage as AssistantMessage & { _feishu_chat_id?: string })._feishu_chat_id = target;
     await this._messageGateway.postMessage(assistantMessage);
+  };
+
+  /**
+   * Deliver a turn clark did NOT initiate (detected by the warm pane's follower)
+   * to the Feishu chat bound to its session. Without this, an autonomous turn's
+   * result — e.g. the doc link Claude produces after background subagents finish —
+   * would land only in the TUI/transcript and never reach the user. Mirrors the
+   * scheduled-task push path: a plain `postMessage` addressed via `_feishu_chat_id`.
+   */
+  private _deliverOutOfBandTurn = async (
+    sessionId: string,
+    message: AssistantMessage,
+  ): Promise<void> => {
+    const chatId = this._sessionManager.getSessionChat(sessionId);
+    if (!chatId) {
+      this._logger.warn(
+        { session_id: sessionId },
+        "autonomous turn has no bound chat — dropping",
+      );
+      return;
+    }
+    const outbound = {
+      role: "assistant",
+      session_id: sessionId,
+      content: message.content,
+      _feishu_chat_id: chatId,
+    } as Omit<AssistantMessage, "id"> & { _feishu_chat_id: string };
+    try {
+      await this._messageGateway.postMessage(outbound);
+      this._logger.info(
+        { session_id: sessionId, chat_id: chatId },
+        "delivered autonomous (out-of-band) turn",
+      );
+    } catch (err) {
+      this._logger.warn(
+        { err, session_id: sessionId },
+        "failed to deliver autonomous turn",
+      );
+    }
   };
 
   /** Extract Feishu chat_id from the message (attached by FeishuMessageChannel). */

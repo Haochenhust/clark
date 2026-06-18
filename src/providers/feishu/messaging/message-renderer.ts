@@ -38,13 +38,11 @@ export async function renderMessageCard(
     streaming,
     uploadImage,
     runResult,
-    effortLevel,
     sessionId,
   }: {
     streaming: boolean;
     uploadImage: (path: string) => Promise<string>;
     runResult?: RunResult;
-    effortLevel?: string;
     sessionId?: string;
   },
 ): Promise<Card> {
@@ -119,7 +117,7 @@ export async function renderMessageCard(
     }
 
     if (runResult || sessionId) {
-      card.body.elements.push(_renderFooter(sessionId, runResult, effortLevel));
+      card.body.elements.push(_renderFooter(sessionId, runResult));
     }
   }
 
@@ -311,13 +309,13 @@ function _renderTool(
   }
 }
 
-function _renderFooter(sessionId?: string, runResult?: RunResult, effortLevel?: string): DivElement {
+function _renderFooter(sessionId?: string, runResult?: RunResult): DivElement {
   const parts: string[] = [];
   if (runResult) {
-    const { model, usage, context_window, context_used } = runResult;
+    const { model, effort, usage, context_window, context_used } = runResult;
     const totalInput = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
     const totalOutput = usage.output_tokens;
-    const effortStr = effortLevel ? ` · effort: ${effortLevel}` : "";
+    const effortStr = effort ? ` · effort: ${effort}` : "";
     // Session context consumption (how full the window is); no dollar cost —
     // clark runs on the Claude Code subscription. Mirror live-card-renderer.ts.
     let ctxStr = "";

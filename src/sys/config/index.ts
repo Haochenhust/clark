@@ -75,7 +75,9 @@ export const config: Config = {
         return (_readClaudeSettings().model as string) ?? "claude-sonnet-4-6";
       },
       get effortLevel() {
-        return (_readClaudeSettings().effortLevel as string) ?? "normal";
+        // Default must be a value `claude --effort` accepts (low/medium/high/
+        // xhigh/max); "normal" is NOT one of them and would fail pane spawn.
+        return (_readClaudeSettings().effortLevel as string) ?? "high";
       },
     },
   },

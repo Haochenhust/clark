@@ -30,6 +30,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -77,6 +78,16 @@ const MAX_INJECT_ATTEMPTS = parseInt(getEnv("CLARK_TMUX_MAX_INJECT_ATTEMPTS", "3
 const RESPONSE_GRACE_MS = parseInt(getEnv("CLARK_TMUX_RESPONSE_GRACE_MS", "30000"), 10);
 /** After the Stop sentinel fires, keep tailing this long to drain the final line. */
 const STOP_DRAIN_MS = parseInt(getEnv("CLARK_TMUX_STOP_DRAIN_MS", "1500"), 10);
+/**
+ * Poll interval for the lifetime follower — the loop that watches the warm pane
+ * BETWEEN clark's own turns and delivers any turn clark did not initiate (e.g. a
+ * turn Claude Code runs autonomously when a background task / async subagent
+ * finishes and injects a `<task-notification>`). Coarser than the in-turn tail
+ * since nothing is waiting on it.
+ */
+const FOLLOW_POLL_MS = parseInt(getEnv("CLARK_FOLLOW_POLL_MS", "1000"), 10);
+/** Autonomous-turn final texts that mean "nothing to push" — never delivered. */
+const NO_OP_TURN_OUTPUTS = new Set(["No response requested."]);
 /**
  * The deadlock guard: a turn is "wedged" only when it shows NO sign of life for
  * this long — no transcript growth AND the claude process tree burns no CPU. A
@@ -259,6 +270,7 @@ function countCompleteLines(raw: string): number {
 
 interface RunState {
   model: string;
+  effort: string;
   inputTokens: number;
   outputTokens: number;
   cacheRead: number;
@@ -269,6 +281,7 @@ interface RunState {
 function freshState(): RunState {
   return {
     model: config.agents.default.model,
+    effort: config.agents.default.effortLevel,
     inputTokens: 0,
     outputTokens: 0,
     cacheRead: 0,
@@ -336,6 +349,10 @@ interface WarmPane {
   sentinel: string;
   settingsPath: string;
   promptFile: string;
+  /** Effort level this pane's `claude` was spawned with (the `--effort` value),
+   *  captured at spawn so the footer reflects the pane's ACTUAL runtime effort
+   *  even if settings.json changes before the pane is replaced. */
+  effort: string;
   /** PID of the claude process in the pane — root of the CPU liveness probe. */
   panePid?: number;
 }
@@ -355,6 +372,30 @@ export class WarmPaneManager {
   /** Strict serial guard — clark only ever runs one turn at a time. */
   private _busy = false;
   private _logger = logger;
+
+  /**
+   * Persistent transcript cursor (count of complete lines already consumed) for
+   * the current pane's session. Shared by the in-turn monitor and the lifetime
+   * follower so neither re-emits what the other already handled.
+   */
+  private _cursor = 0;
+  /**
+   * Sentinel mtime (ms) at the last consumed turn-end. A larger mtime while clark
+   * is idle ⇒ a turn ended that clark did NOT initiate (an autonomous turn).
+   */
+  private _lastSentinelMs = 0;
+  /** True while the lifetime follower loop is running; set false to stop it. */
+  private _following = false;
+
+  /**
+   * Delivery sink for turns clark did not initiate. The kernel sets this to route
+   * an autonomous turn's final answer to the session's bound Feishu chat. Without
+   * it, such turns would land only in the transcript/TUI and never reach the user.
+   */
+  onOutOfBandTurn?: (
+    sessionId: string,
+    message: AssistantMessage,
+  ) => void | Promise<void>;
 
   /**
    * Run one turn for `userMessage` in the warm pane (spawning/reusing as needed),
@@ -378,6 +419,15 @@ export class WarmPaneManager {
 
     try {
       pane = await this._ensurePane(sessionId, options);
+      // Bind the footer's effort to the pane's ACTUAL launch param (set at spawn),
+      // so it stays truthful even if settings.json changed after this pane started.
+      state.effort = pane.effort;
+
+      // Deliver any autonomous turn that completed while clark was idle BEFORE we
+      // inject — otherwise the new baseline below would bury it (the monitor only
+      // reads lines past `baseline`, so its lines would never be emitted). No drain
+      // grace: a turn old enough that the user is now messaging has long flushed.
+      await this._drainAutonomousTurn(pane, false).catch(() => {});
 
       const prompt = extractTextContent(userMessage);
       // A prompt starting with `!` is a bash command to the TUI even under paste; neutralize.
@@ -399,6 +449,12 @@ export class WarmPaneManager {
       yield this._buildRunResult(state);
     } finally {
       if (pane) await this._settle(pane, outcome).catch(() => {});
+      // Re-baseline the follower past everything this turn wrote, so it never
+      // mistakes clark's own just-finished turn for an autonomous one.
+      if (this._pane && this._pane.sessionId === sessionId) {
+        this._cursor = this._transcriptLineCount(sessionId);
+        this._lastSentinelMs = this._sentinelMtimeMs(this._pane);
+      }
       this._busy = false;
     }
   }
@@ -413,6 +469,7 @@ export class WarmPaneManager {
    */
   async killAllPanes(): Promise<void> {
     this._pane = null;
+    this.stopFollowing();
     const out = (await tmux(["list-panes", "-a", "-F", "#{session_name} #{pane_pid}"])).stdout;
     const targets: Array<{ name: string; pid: number }> = [];
     for (const line of out.split("\n")) {
@@ -454,6 +511,11 @@ export class WarmPaneManager {
     }
     const pane = await this._spawn(sessionId, options);
     this._pane = pane;
+    // Baseline past any pre-existing transcript history (a --resume session has
+    // a full backlog) so the follower only ever delivers turns from here on.
+    this._cursor = this._transcriptLineCount(sessionId);
+    this._lastSentinelMs = this._sentinelMtimeMs(pane);
+    this._startFollowing(pane);
     return pane;
   }
 
@@ -461,12 +523,17 @@ export class WarmPaneManager {
     const dir = join(config.paths.store, "clark-tmux");
     mkdirSync(dir, { recursive: true });
     const name = `clark-${sessionId.slice(0, 8)}`;
+    // Read effort ONCE so the pane's recorded effort is exactly what we pass to
+    // `--effort` below (same settings snapshot); the footer later reports this
+    // captured value, not a possibly-changed config.
+    const effort = config.agents.default.effortLevel;
     const pane: WarmPane = {
       sessionId,
       name,
       sentinel: join(dir, `stop-${sessionId}.done`),
       settingsPath: join(dir, `settings-${sessionId}.json`),
       promptFile: join(dir, `prompt-${sessionId}.txt`),
+      effort,
     };
     writeFileSync(pane.settingsPath, paneSettings(pane.sentinel));
     rmSync(pane.sentinel, { force: true });
@@ -478,6 +545,12 @@ export class WarmPaneManager {
       sessionId,
       "--model",
       config.agents.default.model,
+      // --effort is the ONLY way to reach session-only levels like `max`: the
+      // settings.json `effortLevel` field rejects them (it accepts only
+      // low/medium/high/xhigh), so without this flag the configured effort never
+      // reaches claude and it silently falls back to its default (high).
+      "--effort",
+      effort,
       "--settings",
       pane.settingsPath,
     ];
@@ -632,6 +705,105 @@ export class WarmPaneManager {
     }
   }
 
+  // --- the lifetime follower (delivers turns clark did NOT initiate) ---
+
+  /** mtime (ms) of the Stop sentinel, or 0 if it doesn't exist yet. */
+  private _sentinelMtimeMs(pane: WarmPane): number {
+    try {
+      return statSync(pane.sentinel).mtimeMs;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Start the lifetime follower for `pane` (idempotent while one is running). */
+  private _startFollowing(pane: WarmPane): void {
+    if (this._following) return;
+    this._following = true;
+    void this._followLoop(pane);
+  }
+
+  /** Stop the follower (called on teardown / reset). */
+  stopFollowing(): void {
+    this._following = false;
+  }
+
+  /**
+   * Between clark's own turns, watch the pane for a turn it did not initiate —
+   * Claude Code runs one whenever a background task / async subagent finishes and
+   * injects a `<task-notification>`. Such a turn's output lands in the transcript
+   * with no monitor attached; this loop IS that monitor, delivering the result to
+   * the bound chat. Pauses while `_busy` (the in-turn monitor owns the transcript).
+   */
+  private async _followLoop(pane: WarmPane): Promise<void> {
+    while (this._following) {
+      await sleep(FOLLOW_POLL_MS);
+      if (!this._following || this._pane !== pane) break;
+      if (this._busy) continue; // an injected turn owns the transcript + cursor
+      if (!(await paneAlive(pane.name))) break;
+      try {
+        await this._drainAutonomousTurn(pane, true);
+      } catch (err) {
+        this._logger.warn({ err, session_id: pane.sessionId }, "follower delivery failed");
+      }
+    }
+  }
+
+  /**
+   * If a turn clark didn't initiate has ended (Stop sentinel mtime advanced past
+   * the last consumed turn AND new transcript lines exist), parse the new lines,
+   * advance the shared cursor past them, and hand the turn's final answer to
+   * `onOutOfBandTurn`. `drain` waits {@link STOP_DRAIN_MS} for a late-flushed final
+   * line (the live loop drains; the pre-inject flush does not — an old turn has
+   * long settled). The cursor advances once a boundary is crossed regardless of
+   * deliverability, so a turn is never delivered twice.
+   */
+  private async _drainAutonomousTurn(pane: WarmPane, drain: boolean): Promise<void> {
+    const mtime = this._sentinelMtimeMs(pane);
+    if (mtime <= this._lastSentinelMs) return; // no turn ended since we last looked
+
+    const transcript = findTranscriptById(pane.sessionId);
+    if (!transcript) return;
+    let lines = readFileSync(transcript, "utf-8").split("\n").slice(0, -1);
+    if (lines.length <= this._cursor) {
+      this._lastSentinelMs = mtime; // sentinel touched but nothing new — just consume it
+      return;
+    }
+    if (drain) {
+      await sleep(STOP_DRAIN_MS);
+      lines = readFileSync(transcript, "utf-8").split("\n").slice(0, -1);
+    }
+
+    const state = freshState();
+    let finalAssistant: AssistantMessage | null = null;
+    for (let i = this._cursor; i < lines.length; i++) {
+      const line = lines[i]?.trim();
+      if (!line) continue;
+      let obj: any;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const parsed = parseTranscriptObj(obj, pane.sessionId, state);
+      if (parsed && parsed.role === "assistant") {
+        const text = parsed.content.filter((c) => c.type === "text");
+        if (text.length > 0) finalAssistant = { ...parsed, content: text };
+      }
+    }
+    this._cursor = lines.length;
+    this._lastSentinelMs = mtime;
+
+    if (!finalAssistant) return; // tool-only turn — no text answer to push
+    const text = extractTextContent(finalAssistant).trim();
+    if (!text || text.includes("[SKIPPED]") || NO_OP_TURN_OUTPUTS.has(text)) return;
+    this._logger.info(
+      { session_id: pane.sessionId },
+      "delivering autonomous (out-of-band) turn",
+    );
+    await this.onOutOfBandTurn?.(pane.sessionId, finalAssistant);
+  }
+
   // --- injection ---
 
   /** Clear the input (C-u), (re)load + bracketed-paste the prompt, pause, Enter. */
@@ -676,6 +848,7 @@ export class WarmPaneManager {
 
   /** Graceful `/exit` → bounded wait → SIGKILL. Always ends, always cleans up files. */
   private async _teardown(pane: WarmPane): Promise<void> {
+    this.stopFollowing(); // the pane is going away; a fresh spawn restarts the follower
     try {
       await sendKey(pane.name, "Escape");
       await sleep(150);
@@ -715,6 +888,7 @@ export class WarmPaneManager {
     return {
       type: "run_result",
       model: state.model,
+      effort: state.effort,
       cost_usd: 0, // interactive transcripts don't report a per-turn dollar cost
       usage: {
         input_tokens: state.inputTokens,
